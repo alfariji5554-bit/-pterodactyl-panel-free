@@ -23,10 +23,12 @@ export default function ServersPage() {
   const [memory, setMemory] = useState(1024);
   const [disk, setDisk] = useState(5120);
   const [creating, setCreating] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
   const router = useRouter();
   const supabase = createClient();
 
   async function loadServers() {
+    setErrorMsg("");
     const {
       data: { user },
     } = await supabase.auth.getUser();
@@ -41,7 +43,10 @@ export default function ServersPage() {
       .select("id, name, status, memory_mb, disk_mb, cpu_percent, created_at")
       .order("created_at", { ascending: false });
 
-    if (!error && data) {
+    if (error) {
+      setErrorMsg("LOAD ERROR: " + error.message);
+      alert("LOAD ERROR: " + error.message);
+    } else if (data) {
       setServers(data);
     }
     setLoading(false);
@@ -54,12 +59,14 @@ export default function ServersPage() {
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     setCreating(true);
+    setErrorMsg("");
 
     const {
       data: { user },
     } = await supabase.auth.getUser();
 
     if (!user) {
+      setErrorMsg("Belum login");
       setCreating(false);
       return;
     }
@@ -75,11 +82,8 @@ export default function ServersPage() {
     });
 
     if (error) {
-  alert("Gagal buat server: " + error.message);
-  console.error(error);
-  // tampilkan juga di halaman
-  setName("ERROR: " + error.message);
-  return;
+      setErrorMsg("CREATE ERROR: " + error.message);
+      alert("CREATE ERROR: " + error.message);
     } else {
       setShowCreate(false);
       setName("");
@@ -149,6 +153,12 @@ export default function ServersPage() {
             + Create Server
           </button>
         </div>
+
+        {errorMsg && (
+          <div className="mb-4 p-3 rounded-lg bg-red-500/20 border border-red-500/50 text-red-300 text-sm break-all">
+            {errorMsg}
+          </div>
+        )}
 
         {servers.length === 0 ? (
           <div className="bg-panel-card border border-panel-border rounded-xl p-10 text-center text-panel-muted">
