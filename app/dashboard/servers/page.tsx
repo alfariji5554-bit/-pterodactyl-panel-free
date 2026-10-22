@@ -75,7 +75,11 @@ export default function ServersPage() {
     });
 
     if (error) {
-      alert("Gagal buat server: " + error.message);
+  alert("Gagal buat server: " + error.message);
+  console.error(error);
+  // tampilkan juga di halaman
+  setName("ERROR: " + error.message);
+  return;
     } else {
       setShowCreate(false);
       setName("");
