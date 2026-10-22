@@ -7,6 +7,7 @@ import { useRouter } from "next/navigation";
 export default function DashboardPage() {
   const [email, setEmail] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [stats, setStats] = useState({ total: 0, online: 0, offline: 0 });
   const router = useRouter();
   const supabase = createClient();
 
@@ -18,6 +19,13 @@ export default function DashboardPage() {
         return;
       }
       setEmail(user.email ?? null);
+      const { data: servers } = await supabase.from("servers").select("status");
+      const rows = (servers || []) as Array<{ status: string }>;
+      setStats({
+        total: rows.length,
+        online: rows.filter((server) => server.status === "online").length,
+        offline: rows.filter((server) => server.status !== "online").length,
+      });
       setLoading(false);
     }
     load();
@@ -71,23 +79,23 @@ export default function DashboardPage() {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="bg-panel-card border border-panel-border rounded-xl p-5">
             <div className="text-panel-muted text-sm">Total Server</div>
-            <div className="text-3xl font-bold mt-1">0</div>
+            <div className="text-3xl font-bold mt-1">{stats.total}</div>
           </div>
           <div className="bg-panel-card border border-panel-border rounded-xl p-5">
             <div className="text-panel-muted text-sm">Online</div>
-            <div className="text-3xl font-bold mt-1 text-green-400">0</div>
+            <div className="text-3xl font-bold mt-1 text-green-400">{stats.online}</div>
           </div>
           <div className="bg-panel-card border border-panel-border rounded-xl p-5">
             <div className="text-panel-muted text-sm">Offline</div>
-            <div className="text-3xl font-bold mt-1 text-panel-muted">0</div>
+            <div className="text-3xl font-bold mt-1 text-panel-muted">{stats.offline}</div>
           </div>
         </div>
 
         <div className="mt-8 bg-panel-card border border-panel-border rounded-xl p-6">
           <h2 className="font-medium mb-2">Langkah selanjutnya</h2>
           <p className="text-sm text-panel-muted">
-            Nanti di sini muncul daftar server, tombol create server, file manager, console, dll.
-            Sekarang auth + layout dasar sudah jalan.
+            Gunakan menu Servers untuk mengelola file dan menjalankan proses sementara melalui GitHub Actions.
+            Proses tidak dijamin berjalan 24/7; lihat dokumentasi setup untuk batas runtime.
           </p>
         </div>
       </main>
