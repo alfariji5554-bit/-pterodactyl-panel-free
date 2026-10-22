@@ -1,0 +1,127 @@
+name: Temporary Node Runtime
+run-name: runtime-${{ inputs.server_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_id:
+        description: Supabase server ID
+        required: true
+        type: string
+      server_name:
+        description: Display name
+        required: false
+        type: string
+      startup_command:
+        description: Startup command for this server
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-files:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch files from private Supabase Storage
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SERVER_ID: ${{ inputs.server_id }}
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs/promises");
+          const path = require("node:path");
+          const base = process.env.SUPABASE_URL;
+          const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+          const serverId = process.env.SERVER_ID;
+          if (!base || !key || !serverId) throw new Error("Missing Supabase workflow secrets or server id");
+
+          async function request(url) {
+            const response = await fetch(url, {
+              headers: { apikey: key, Authorization: `Bearer ${key}` },
+            });
+            if (!response.ok) throw new Error(`Supabase request failed (${response.status}): ${await response.text()}`);
+            return response;
+          }
+
+          (async () => {
+            const output = path.resolve("runtime-files");
+            await fs.mkdir(output, { recursive: true });
+            const metadataUrl = new URL("/rest/v1/server_files", base);
+            metadataUrl.searchParams.set("select", "name,storage_path");
+            metadataUrl.searchParams.set("server_id", `eq.${serverId}`);
+            const response = await request(metadataUrl);
+            const files = await response.json();
+            if (!Array.isArray(files)) throw new Error("Unexpected server_files response");
+            if (files.length > 500) throw new Error("Too many files (limit 500)");
+            let total = 0;
+            for (const file of files) {
+              const name = String(file.name || "");
+              const storagePath = String(file.storage_path || "");
+              if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\") || name.includes("\0")) {
+                throw new Error(`Unsafe filename in metadata: ${name}`);
+              }
+              if (!storagePath.startsWith(`${serverId}/`) || storagePath.split("/").some((part) => part === "..")) {
+                throw new Error(`Unsafe storage path for ${name}`);
+              }
+              const objectPath = storagePath.split("/").map(encodeURIComponent).join("/");
+              const fileUrl = new URL(`/storage/v1/object/server-files/${objectPath}`, base);
+              const fileResponse = await request(fileUrl);
+              const data = Buffer.from(await fileResponse.arrayBuffer());
+              total += data.length;
+              if (data.length > 20 * 1024 * 1024 || total > 100 * 1024 * 1024) {
+                throw new Error("Runtime files exceed size limits (20 MB per file, 100 MB total)");
+              }
+              await fs.writeFile(path.join(output, name), data, { flag: "w" });
+            }
+            if (files.length === 0) throw new Error("No files found for this server. Upload files first.");
+            console.log(`Fetched ${files.length} files (${total} bytes).`);
+          })().catch((error) => { console.error(error); process.exit(1); });
+          NODE
+      - name: Upload files as temporary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-files
+          path: runtime-files/
+          if-no-files-found: error
+          retention-days: 1
+
+  execute:
+    needs: fetch-files
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Download runtime files
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-files
+          path: runtime-files
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install dependencies
+        working-directory: runtime-files
+        run: |
+          if [ -f package.json ]; then
+            if [ -f package-lock.json ]; then
+              npm ci
+            else
+              npm install
+            fi
+          else
+            echo "No package.json found; skipping npm install."
+          fi
+      - name: Run startup command
+        working-directory: runtime-files
+        env:
+          STARTUP_COMMAND: ${{ inputs.startup_command }}
+        run: |
+          if [ -z "$STARTUP_COMMAND" ]; then
+            STARTUP_COMMAND="node index.js"
+          fi
+          echo "Starting process. Runtime is temporary and has a maximum job duration."
+          bash -lc "$STARTUP_COMMAND"
