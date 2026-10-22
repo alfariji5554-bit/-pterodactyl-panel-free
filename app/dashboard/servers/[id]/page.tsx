@@ -4,6 +4,7 @@ import { useEffect, useState, use } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import JSZip from "jszip";
 
 type Server = {
   id: string;
@@ -13,15 +14,15 @@ type Server = {
   disk_mb: number;
   cpu_percent: number;
   startup_command: string | null;
-  image: string | null;
 };
 
 type FileRow = {
-  id: number;
+  id?: number;
   path: string;
   name: string;
   is_directory: boolean;
   size_bytes: number;
+  storage_path?: string;
 };
 
 export default function ServerDetailPage({
@@ -33,27 +34,35 @@ export default function ServerDetailPage({
   const [server, setServer] = useState<Server | null>(null);
   const [files, setFiles] = useState<FileRow[]>([]);
   const [tab, setTab] = useState<"console" | "files" | "startup">("console");
-  const [startup, setStartup] = useState("");
+  const [startup, setStartup] = useState("node index.js");
   const [logs, setLogs] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [menuOpen, setMenuOpen] = useState<string | null>(null);
   const router = useRouter();
   const supabase = createClient();
 
+  function addLog(msg: string) {
+    const time = new Date().toLocaleTimeString("id-ID");
+    setLogs((prev) => [`[${time}] ${msg}`, ...prev].slice(0, 200));
+  }
+
   async function load() {
-    const { data: { user } } = await supabase.auth.getUser();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
     if (!user) {
       router.push("/");
       return;
     }
 
-    const { data: s } = await supabase
+    const { data: s, error } = await supabase
       .from("servers")
       .select("*")
       .eq("id", id)
       .single();
 
-    if (!s) {
+    if (error || !s) {
       router.push("/dashboard/servers");
       return;
     }
@@ -63,7 +72,7 @@ export default function ServerDetailPage({
 
     const { data: f } = await supabase
       .from("server_files")
-      .select("id, path, name, is_directory, size_bytes")
+      .select("id, path, name, is_directory, size_bytes, storage_path")
       .eq("server_id", id)
       .order("name");
 
@@ -75,62 +84,51 @@ export default function ServerDetailPage({
     load();
   }, [id]);
 
-  function addLog(msg: string) {
-    const time = new Date().toLocaleTimeString("id-ID");
-    setLogs((prev) => [`[${time}] ${msg}`, ...prev].slice(0, 100));
-  }
-
   async function setStatus(status: string) {
     if (!server) return;
-    const { error } = await supabase
+    await supabase
       .from("servers")
       .update({ status, updated_at: new Date().toISOString() })
       .eq("id", server.id);
-
-    if (error) {
-      addLog("ERROR: " + error.message);
-      return;
-    }
-
     setServer({ ...server, status });
-    addLog(`Status → ${status.toUpperCase()}`);
-
-    await supabase.from("activity_logs").insert({
-      server_id: server.id,
-      action: status,
-      details: { source: "panel" },
-    });
   }
 
   async function handleStart() {
+    if (!server) return;
+    setLogs([]);
+    addLog("Console cleared.");
     addLog("Starting server...");
     await setStatus("starting");
-    setTimeout(async () => {
-      await setStatus("online");
-      addLog("Server is now ONLINE");
-      addLog(`Running: ${startup || "node index.js"}`);
-    }, 1500);
+
+    const hasPackage = files.some((f) => f.name === "package.json");
+
+    if (hasPackage) {
+      addLog("Found package.json");
+      addLog("Running: npm install ...");
+      await new Promise((r) => setTimeout(r, 2000));
+      addLog("npm install completed (simulated — no VPS runner).");
+    } else {
+      addLog("No package.json found — skip npm install.");
+    }
+
+    addLog(`Executing: ${startup}`);
+    await new Promise((r) => setTimeout(r, 1500));
+    await setStatus("online");
+    addLog("Server status → ONLINE");
+    addLog("Note: process is simulated. Real runtime needs a worker/VPS.");
   }
 
   async function handleStop() {
-    addLog("Stopping server...");
+    addLog("Stopping...");
     await setStatus("stopping");
-    setTimeout(async () => {
-      await setStatus("offline");
-      addLog("Server is now OFFLINE");
-    }, 1000);
+    await new Promise((r) => setTimeout(r, 800));
+    await setStatus("offline");
+    addLog("Server status → OFFLINE");
   }
 
   async function handleRestart() {
-    addLog("Restarting...");
-    await setStatus("stopping");
-    setTimeout(async () => {
-      await setStatus("starting");
-      setTimeout(async () => {
-        await setStatus("online");
-        addLog("Server restarted and ONLINE");
-      }, 1200);
-    }, 800);
+    await handleStop();
+    await handleStart();
   }
 
   async function saveStartup() {
@@ -139,10 +137,9 @@ export default function ServerDetailPage({
       .from("servers")
       .update({ startup_command: startup })
       .eq("id", server.id);
-
     if (error) alert(error.message);
     else {
-      addLog("Startup command updated: " + startup);
+      addLog("Startup saved: " + startup);
       setServer({ ...server, startup_command: startup });
     }
   }
@@ -151,17 +148,22 @@ export default function ServerDetailPage({
     const file = e.target.files?.[0];
     if (!file || !server) return;
 
+    if (file.size > 20 * 1024 * 1024) {
+      alert("Maksimal 20 MB");
+      return;
+    }
+
     setUploading(true);
-    addLog(`Uploading ${file.name}...`);
+    addLog(`Uploading \( {file.name} ( \){(file.size / 1024).toFixed(1)} KB)...`);
 
     const path = `\( {server.id}/ \){file.name}`;
-
     const { error: upErr } = await supabase.storage
       .from("server-files")
       .upload(path, file, { upsert: true });
 
     if (upErr) {
       addLog("Upload gagal: " + upErr.message);
+      alert("Upload gagal: " + upErr.message);
       setUploading(false);
       return;
     }
@@ -181,15 +183,103 @@ export default function ServerDetailPage({
     addLog(`Uploaded: ${file.name}`);
     await load();
     setUploading(false);
+    e.target.value = "";
+  }
+
+  async function handleDownload(file: FileRow) {
+    if (!server) return;
+    const storagePath = file.storage_path || `\( {server.id}/ \){file.name}`;
+    const { data, error } = await supabase.storage
+      .from("server-files")
+      .download(storagePath);
+
+    if (error || !data) {
+      alert("Download gagal: " + (error?.message || "no data"));
+      return;
+    }
+
+    const url = URL.createObjectURL(data);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = file.name;
+    a.click();
+    URL.revokeObjectURL(url);
+    addLog(`Downloaded: ${file.name}`);
+  }
+
+  async function handleExtract(file: FileRow) {
+    if (!server) return;
+    if (!file.name.toLowerCase().endsWith(".zip")) {
+      alert("Hanya file .zip yang bisa di-extract");
+      return;
+    }
+
+    setMenuOpen(null);
+    addLog(`Extracting ${file.name}...`);
+
+    const storagePath = file.storage_path || `\( {server.id}/ \){file.name}`;
+    const { data, error } = await supabase.storage
+      .from("server-files")
+      .download(storagePath);
+
+    if (error || !data) {
+      addLog("Extract gagal download: " + (error?.message || ""));
+      return;
+    }
+
+    try {
+      const zip = await JSZip.loadAsync(data);
+      const entries = Object.keys(zip.files);
+      let count = 0;
+
+      for (const entryName of entries) {
+        const entry = zip.files[entryName];
+        if (entry.dir) continue;
+
+        const content = await entry.async("blob");
+        const baseName = entryName.split("/").pop() || entryName;
+        const path = `\( {server.id}/ \){baseName}`;
+
+        await supabase.storage
+          .from("server-files")
+          .upload(path, content, { upsert: true });
+
+        await supabase.from("server_files").upsert(
+          {
+            server_id: server.id,
+            path: "/" + baseName,
+            name: baseName,
+            is_directory: false,
+            size_bytes: content.size,
+            storage_path: path,
+          },
+          { onConflict: "server_id,path" }
+        );
+        count++;
+      }
+
+      addLog(`Extract selesai: ${count} file.`);
+      await load();
+    } catch (err: any) {
+      addLog("Extract error: " + err.message);
+      alert("Extract error: " + err.message);
+    }
   }
 
   async function handleDeleteFile(file: FileRow) {
-    if (!server) return;
-    if (!confirm(`Hapus ${file.name}?`)) return;
-
-    const storagePath = `\( {server.id}/ \){file.name}`;
+    if (!server || !confirm(`Hapus ${file.name}?`)) return;
+    setMenuOpen(null);
+    const storagePath = file.storage_path || `\( {server.id}/ \){file.name}`;
     await supabase.storage.from("server-files").remove([storagePath]);
-    await supabase.from("server_files").delete().eq("id", file.id);
+    if (file.id) {
+      await supabase.from("server_files").delete().eq("id", file.id);
+    } else {
+      await supabase
+        .from("server_files")
+        .delete()
+        .eq("server_id", server.id)
+        .eq("name", file.name);
+    }
     addLog(`Deleted: ${file.name}`);
     await load();
   }
@@ -205,11 +295,13 @@ export default function ServerDetailPage({
   const isOnline = server.status === "online" || server.status === "starting";
 
   return (
-    <div className="min-h-screen flex flex-col">
-      {/* Top bar */}
-      <header className="bg-panel-card border-b border-panel-border px-4 py-3 flex items-center justify-between gap-4">
+    <div className="min-h-screen flex flex-col bg-panel-bg text-white">
+      <header className="bg-panel-card border-b border-panel-border px-4 py-3 flex items-center justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
-          <Link href="/dashboard/servers" className="text-panel-muted hover:text-white text-sm">
+          <Link
+            href="/dashboard/servers"
+            className="text-panel-muted hover:text-white text-sm shrink-0"
+          >
             ← Servers
           </Link>
           <span className="font-medium truncate">{server.name}</span>
@@ -225,7 +317,6 @@ export default function ServerDetailPage({
             {server.status}
           </span>
         </div>
-
         <div className="flex gap-2 shrink-0">
           <button
             onClick={handleStart}
@@ -250,7 +341,6 @@ export default function ServerDetailPage({
         </div>
       </header>
 
-      {/* Tabs */}
       <div className="bg-panel-card border-b border-panel-border px-4 flex gap-1">
         {(["console", "files", "startup"] as const).map((t) => (
           <button
@@ -267,12 +357,14 @@ export default function ServerDetailPage({
         ))}
       </div>
 
-      {/* Content */}
       <main className="flex-1 p-4 overflow-auto">
         {tab === "console" && (
-          <div className="bg-black rounded-xl border border-panel-border h-[60vh] overflow-y-auto p-4 font-mono text-sm">
+          <div className="bg-black rounded-xl border border-panel-border h-[65vh] overflow-y-auto p-4 font-mono text-sm space-y-0.5">
             {logs.length === 0 ? (
-              <div className="text-panel-muted">Console siap. Tekan Start untuk menjalankan server.</div>
+              <div className="text-panel-muted">
+                Console kosong. Tekan Start untuk menjalankan (akan clear + install
+                jika ada package.json).
+              </div>
             ) : (
               logs.map((l, i) => (
                 <div key={i} className="text-green-400/90 leading-relaxed">
@@ -285,7 +377,7 @@ export default function ServerDetailPage({
 
         {tab === "files" && (
           <div className="space-y-4">
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-3">
               <label className="bg-panel-accent hover:bg-blue-600 text-white text-sm px-4 py-2 rounded-lg cursor-pointer">
                 {uploading ? "Uploading..." : "Upload File"}
                 <input
@@ -293,34 +385,71 @@ export default function ServerDetailPage({
                   className="hidden"
                   onChange={handleUpload}
                   disabled={uploading}
+                  accept=".zip,.js,.ts,.json,.py,.txt,.md,.jar,.yml,.yaml"
                 />
               </label>
               <span className="text-xs text-panel-muted">
-                Bisa upload .zip, .js, .py, dll. Extract zip nanti (butuh worker).
+                Max 20 MB · zip bisa di-Extract
               </span>
             </div>
 
             {files.length === 0 ? (
               <div className="bg-panel-card border border-panel-border rounded-xl p-8 text-center text-panel-muted">
-                Belum ada file. Upload dulu.
+                Belum ada file. Upload zip / package.json / index.js dulu.
               </div>
             ) : (
               <div className="bg-panel-card border border-panel-border rounded-xl divide-y divide-panel-border">
                 {files.map((f) => (
-                  <div key={f.id} className="flex items-center justify-between px-4 py-3">
+                  <div
+                    key={f.name + (f.id || "")}
+                    className="flex items-center justify-between px-4 py-3 gap-2"
+                  >
                     <div className="flex items-center gap-3 min-w-0">
-                      <span className="text-panel-muted text-sm">{f.is_directory ? "📁" : "📄"}</span>
+                      <span className="text-sm">
+                        {f.name.endsWith(".zip") ? "📦" : "📄"}
+                      </span>
                       <span className="text-sm truncate">{f.name}</span>
                       <span className="text-xs text-panel-muted shrink-0">
                         {(f.size_bytes / 1024).toFixed(1)} KB
                       </span>
                     </div>
-                    <button
-                      onClick={() => handleDeleteFile(f)}
-                      className="text-xs text-red-400 hover:text-red-300"
-                    >
-                      Hapus
-                    </button>
+                    <div className="relative shrink-0">
+                      <button
+                        onClick={() =>
+                          setMenuOpen(menuOpen === f.name ? null : f.name)
+                        }
+                        className="text-panel-muted hover:text-white px-2 py-1 text-lg leading-none"
+                      >
+                        ⋯
+                      </button>
+                      {menuOpen === f.name && (
+                        <div className="absolute right-0 top-8 z-20 bg-panel-card border border-panel-border rounded-lg shadow-xl py-1 min-w-[140px]">
+                          <button
+                            onClick={() => {
+                              setMenuOpen(null);
+                              handleDownload(f);
+                            }}
+                            className="block w-full text-left px-3 py-2 text-sm hover:bg-panel-border/50"
+                          >
+                            Download
+                          </button>
+                          {f.name.toLowerCase().endsWith(".zip") && (
+                            <button
+                              onClick={() => handleExtract(f)}
+                              className="block w-full text-left px-3 py-2 text-sm hover:bg-panel-border/50"
+                            >
+                              Extract / Unarchive
+                            </button>
+                          )}
+                          <button
+                            onClick={() => handleDeleteFile(f)}
+                            className="block w-full text-left px-3 py-2 text-sm text-red-400 hover:bg-panel-border/50"
+                          >
+                            Hapus
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -331,7 +460,9 @@ export default function ServerDetailPage({
         {tab === "startup" && (
           <div className="max-w-xl space-y-4">
             <div>
-              <label className="block text-sm text-panel-muted mb-1">Startup Command</label>
+              <label className="block text-sm text-panel-muted mb-1">
+                Startup Command
+              </label>
               <input
                 value={startup}
                 onChange={(e) => setStartup(e.target.value)}
@@ -339,9 +470,7 @@ export default function ServerDetailPage({
                 placeholder="node index.js"
               />
               <p className="text-xs text-panel-muted mt-2">
-                Contoh: <code>node index.js</code> · <code>npm start</code> ·{" "}
-                <code>python main.py</code> ·{" "}
-                <code>java -Xmx1024M -jar server.jar</code>
+                Contoh: node index.js · npm start · python main.py
               </p>
             </div>
             <button
