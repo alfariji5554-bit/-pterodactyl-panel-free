@@ -35,6 +35,15 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(new URL("/", request.url));
   }
 
+  const adminEmail = process.env.PANEL_ADMIN_EMAIL?.trim().toLowerCase();
+  if (user && !adminEmail && request.nextUrl.pathname.startsWith("/dashboard")) {
+    return NextResponse.redirect(new URL("/setup-required", request.url));
+  }
+
+  if (user && adminEmail && (user.email || "").toLowerCase() !== adminEmail) {
+    return NextResponse.redirect(new URL("/unauthorized", request.url));
+  }
+
   if (user && request.nextUrl.pathname === "/") {
     return NextResponse.redirect(new URL("/dashboard", request.url));
   }

@@ -36,6 +36,7 @@ export default function ServerDetailPage({
   const [tab, setTab] = useState<"console" | "files" | "startup">("console");
   const [startup, setStartup] = useState("node index.js");
   const [logs, setLogs] = useState<string[]>([]);
+  const [runUrl, setRunUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [menuOpen, setMenuOpen] = useState<string | null>(null);
@@ -82,6 +83,22 @@ export default function ServerDetailPage({
 
   useEffect(() => {
     load();
+    const timer = window.setInterval(async () => {
+      try {
+        const response = await fetch(`/api/runtime/status?serverId=${encodeURIComponent(id)}`);
+        if (!response.ok) return;
+        const result = await response.json();
+        if (result.status && result.status !== server?.status) {
+          setServer((current) => current ? { ...current, status: result.status } : current);
+        }
+        if (result.runUrl) {
+          setRunUrl(result.runUrl);
+        }
+      } catch {
+        // Status polling is best-effort; the panel remains usable if the runner is unavailable.
+      }
+    }, 10000);
+    return () => window.clearInterval(timer);
   }, [id]);
 
   async function setStatus(status: string) {
@@ -93,41 +110,38 @@ export default function ServerDetailPage({
     setServer({ ...server, status });
   }
 
-  async function handleStart() {
+  async function runtimeAction(action: "start" | "stop") {
     if (!server) return;
-    setLogs([]);
-    addLog("Console cleared.");
-    addLog("Starting server...");
-    await setStatus("starting");
-
-    const hasPackage = files.some((f) => f.name === "package.json");
-
-    if (hasPackage) {
-      addLog("Found package.json");
-      addLog("Running: npm install ...");
-      await new Promise((r) => setTimeout(r, 2000));
-      addLog("npm install completed (simulated — no VPS runner).");
-    } else {
-      addLog("No package.json found — skip npm install.");
+    try {
+      addLog(action === "start" ? "Mengirim permintaan start ke GitHub Actions..." : "Mengirim permintaan stop...");
+      const response = await fetch(`/api/runtime/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ serverId: server.id }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Permintaan runtime gagal");
+      addLog(result.message || (action === "start" ? "Runtime dijadwalkan." : "Runtime dihentikan."));
+      if (result.runUrl) addLog(`GitHub Actions: ${result.runUrl}`);
+      await load();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Terjadi kesalahan";
+      addLog("ERROR: " + message);
+      alert(message);
     }
+  }
 
-    addLog(`Executing: ${startup}`);
-    await new Promise((r) => setTimeout(r, 1500));
-    await setStatus("online");
-    addLog("Server status → ONLINE");
-    addLog("Note: process is simulated. Real runtime needs a worker/VPS.");
+  async function handleStart() {
+    await runtimeAction("start");
   }
 
   async function handleStop() {
-    addLog("Stopping...");
-    await setStatus("stopping");
-    await new Promise((r) => setTimeout(r, 800));
-    await setStatus("offline");
-    addLog("Server status → OFFLINE");
+    await runtimeAction("stop");
   }
 
   async function handleRestart() {
     await handleStop();
+    await new Promise((resolve) => setTimeout(resolve, 1200));
     await handleStart();
   }
 
@@ -154,9 +168,9 @@ export default function ServerDetailPage({
     }
 
     setUploading(true);
-    addLog(`Uploading \( {file.name} ( \){(file.size / 1024).toFixed(1)} KB)...`);
+    addLog(`Uploading ${file.name} (${(file.size / 1024).toFixed(1)} KB)...`);
 
-    const path = `\( {server.id}/ \){file.name}`;
+    const path = `${server.id}/${file.name}`;
     const { error: upErr } = await supabase.storage
       .from("server-files")
       .upload(path, file, { upsert: true });
@@ -188,7 +202,7 @@ export default function ServerDetailPage({
 
   async function handleDownload(file: FileRow) {
     if (!server) return;
-    const storagePath = file.storage_path || `\( {server.id}/ \){file.name}`;
+    const storagePath = file.storage_path || `${server.id}/${file.name}`;
     const { data, error } = await supabase.storage
       .from("server-files")
       .download(storagePath);
@@ -217,7 +231,7 @@ export default function ServerDetailPage({
     setMenuOpen(null);
     addLog(`Extracting ${file.name}...`);
 
-    const storagePath = file.storage_path || `\( {server.id}/ \){file.name}`;
+    const storagePath = file.storage_path || `${server.id}/${file.name}`;
     const { data, error } = await supabase.storage
       .from("server-files")
       .download(storagePath);
@@ -238,7 +252,7 @@ export default function ServerDetailPage({
 
         const content = await entry.async("blob");
         const baseName = entryName.split("/").pop() || entryName;
-        const path = `\( {server.id}/ \){baseName}`;
+        const path = `${server.id}/${baseName}`;
 
         await supabase.storage
           .from("server-files")
@@ -269,7 +283,7 @@ export default function ServerDetailPage({
   async function handleDeleteFile(file: FileRow) {
     if (!server || !confirm(`Hapus ${file.name}?`)) return;
     setMenuOpen(null);
-    const storagePath = file.storage_path || `\( {server.id}/ \){file.name}`;
+    const storagePath = file.storage_path || `${server.id}/${file.name}`;
     await supabase.storage.from("server-files").remove([storagePath]);
     if (file.id) {
       await supabase.from("server_files").delete().eq("id", file.id);
@@ -292,7 +306,7 @@ export default function ServerDetailPage({
     );
   }
 
-  const isOnline = server.status === "online" || server.status === "starting";
+  const isOnline = server.status === "online" || server.status === "starting" || server.status === "queued";
 
   return (
     <div className="min-h-screen flex flex-col bg-panel-bg text-white">
@@ -367,10 +381,17 @@ export default function ServerDetailPage({
               </div>
             ) : (
               logs.map((l, i) => (
-                <div key={i} className="text-green-400/90 leading-relaxed">
+                <div key={i} className="text-green-400/90 leading-relaxed break-words">
                   {l}
                 </div>
               ))
+            )}
+            {runUrl && (
+              <div className="mt-4 border-t border-panel-border pt-3">
+                <a className="text-blue-400 hover:underline" href={runUrl} target="_blank" rel="noreferrer">
+                  Buka log runtime di GitHub Actions ↗
+                </a>
+              </div>
             )}
           </div>
         )}

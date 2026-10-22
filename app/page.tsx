@@ -7,7 +7,6 @@ import { useRouter } from "next/navigation";
 export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [isRegister, setIsRegister] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const router = useRouter();
@@ -19,26 +18,10 @@ export default function LoginPage() {
     setError("");
 
     try {
-      if (isRegister) {
-        const { error } = await supabase.auth.signUp({
-          email,
-          password,
-          options: {
-            data: { username: email.split("@")[0] },
-          },
-        });
-        if (error) throw error;
-        alert("Register berhasil! Silakan login.");
-        setIsRegister(false);
-      } else {
-        const { error } = await supabase.auth.signInWithPassword({
-          email,
-          password,
-        });
-        if (error) throw error;
-        router.push("/dashboard");
-        router.refresh();
-      }
+      const { error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+      router.push("/dashboard");
+      router.refresh();
     } catch (err: any) {
       setError(err.message || "Terjadi kesalahan");
     } finally {
@@ -91,22 +74,12 @@ export default function LoginPage() {
             disabled={loading}
             className="w-full bg-panel-accent hover:bg-blue-600 disabled:opacity-50 text-white font-medium rounded-lg py-2.5 text-sm transition"
           >
-            {loading ? "Memproses..." : isRegister ? "Daftar" : "Masuk"}
+            {loading ? "Memproses..." : "Masuk"}
           </button>
         </form>
 
-        <p className="text-center text-sm text-panel-muted mt-6">
-          {isRegister ? "Sudah punya akun?" : "Belum punya akun?"}{" "}
-          <button
-            type="button"
-            onClick={() => {
-              setIsRegister(!isRegister);
-              setError("");
-            }}
-            className="text-panel-accent hover:underline"
-          >
-            {isRegister ? "Login" : "Daftar"}
-          </button>
+        <p className="text-center text-xs text-panel-muted mt-6">
+          Akses privat. Buat akun admin pertama melalui Supabase Dashboard.
         </p>
       </div>
     </div>
