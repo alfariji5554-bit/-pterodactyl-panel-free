@@ -1,3 +1,4 @@
+
 name: Temporary Node Runtime
 run-name: runtime-${{ inputs.server_id }}
 
@@ -13,9 +14,10 @@ on:
         required: false
         type: string
       startup_command:
-        description: Startup command
+        description: Startup command, dijalankan dari folder package.json
         required: true
         type: string
+        default: node index.js
 
 permissions:
   contents: read
@@ -24,6 +26,7 @@ jobs:
   fetch-files:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: Fetch files from Supabase
         env:
@@ -34,13 +37,16 @@ jobs:
           node <<'NODE'
           const fs = require('node:fs/promises');
           const path = require('node:path');
+          const { execFileSync } = require('node:child_process');
 
           const base = process.env.SUPABASE_URL;
           const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
           const serverId = process.env.SERVER_ID;
 
           if (!base || !key || !serverId) {
-            throw new Error('Secret Supabase atau server ID kosong.');
+            throw new Error(
+              'Secret SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, atau server ID kosong.'
+            );
           }
 
           async function request(url) {
@@ -78,7 +84,10 @@ jobs:
             }
 
             const files = rows.filter(
-              f => f.is_directory !== true && f.storage_path
+              file =>
+                file.is_directory !== true &&
+                typeof file.storage_path === 'string' &&
+                file.storage_path.length > 0
             );
 
             if (files.length === 0) {
@@ -94,11 +103,13 @@ jobs:
             let total = 0;
 
             for (const file of files) {
-              const storagePath = String(file.storage_path);
+              const storagePath = file.storage_path;
               const prefix = `${serverId}/`;
 
               if (!storagePath.startsWith(prefix)) {
-                throw new Error(`Storage path tidak valid: ${file.name}`);
+                throw new Error(
+                  `Storage path tidak valid: ${file.name}`
+                );
               }
 
               const relative = storagePath.slice(prefix.length);
@@ -106,16 +117,25 @@ jobs:
 
               if (
                 !relative ||
-                parts.some(p => !p || p === '.' || p === '..') ||
+                parts.some(
+                  part =>
+                    !part ||
+                    part === '.' ||
+                    part === '..'
+                ) ||
                 path.isAbsolute(relative)
               ) {
-                throw new Error(`Path file tidak aman: ${file.name}`);
+                throw new Error(
+                  `Path file tidak aman: ${file.name}`
+                );
               }
 
               const destination = path.resolve(output, relative);
 
               if (!destination.startsWith(output + path.sep)) {
-                throw new Error('Path keluar dari direktori runtime.');
+                throw new Error(
+                  'Path file keluar dari direktori runtime.'
+                );
               }
 
               const objectPath = storagePath
@@ -128,8 +148,9 @@ jobs:
                 base
               );
 
+              const response = await request(fileUrl);
               const data = Buffer.from(
-                await (await request(fileUrl)).arrayBuffer()
+                await response.arrayBuffer()
               );
 
               total += data.length;
@@ -138,7 +159,9 @@ jobs:
                 data.length > 20 * 1024 * 1024 ||
                 total > 100 * 1024 * 1024
               ) {
-                throw new Error('Ukuran file melewati batas runtime.');
+                throw new Error(
+                  'Ukuran file melewati batas runtime.'
+                );
               }
 
               await fs.mkdir(path.dirname(destination), {
@@ -150,7 +173,18 @@ jobs:
 
             console.log(`Berhasil mengambil ${files.length} file.`);
             console.log(`Total ukuran: ${total} bytes.`);
-            console.log('File root:', await fs.readdir(output));
+            console.log('Struktur file runtime:');
+
+            execFileSync(
+              'find',
+              [
+                output,
+                '-maxdepth', '5',
+                '-type', 'f',
+                '-not', '-path', '*/node_modules/*'
+              ],
+              { stdio: 'inherit' }
+            );
           }
 
           main().catch(error => {
@@ -184,36 +218,60 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Show files and diagnose
-        working-directory: runtime-files
+      - name: Find bot folder
+        id: locate
+        shell: bash
         run: |
-          echo "Runtime directory: $PWD"
-          find . -maxdepth 3 -type f \
-            ! -path './node_modules/*' | sort | head -200
+          set -euo pipefail
 
-      - name: Install dependencies
-        working-directory: runtime-files
-        run: |
-          if [ -f package.json ]; then
-            if [ -f package-lock.json ]; then
-              npm ci
-            else
-              npm install
-            fi
-          else
-            echo "::error::package.json tidak ada di root runtime."
-            echo "Periksa lokasi folder bot dan startup command."
+          echo "Mencari package.json..."
+          find runtime-files \
+            -maxdepth 5 \
+            -type f \
+            ! -path '*/node_modules/*' \
+            | sort \
+            | head -250
+
+          PACKAGE_JSON="$(
+            find runtime-files \
+              -maxdepth 5 \
+              -type f \
+              -name package.json \
+              ! -path '*/node_modules/*' \
+              -print -quit
+          )"
+
+          if [ -z "$PACKAGE_JSON" ]; then
+            echo "::error::package.json tidak ditemukan di runtime-files atau subfolder."
             exit 1
           fi
 
+          APP_DIR="$(dirname "$PACKAGE_JSON")"
+
+          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+          echo "Folder bot ditemukan: $APP_DIR"
+
+      - name: Install dependencies
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
       - name: Start bot
-        working-directory: runtime-files
+        working-directory: ${{ steps.locate.outputs.app_dir }}
         env:
           STARTUP_COMMAND: ${{ inputs.startup_command }}
         run: |
+          set -e
+
           if [ -z "$STARTUP_COMMAND" ]; then
             STARTUP_COMMAND="node index.js"
           fi
 
-          echo "Menjalankan perintah startup..."
+          echo "Folder bot: $PWD"
+          echo "Menjalankan startup command..."
+
           bash -lc "$STARTUP_COMMAND"
