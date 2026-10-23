@@ -245,34 +245,64 @@ export default function ServerDetailPage({
       const zip = await JSZip.loadAsync(data);
       const entries = Object.keys(zip.files);
       let count = 0;
+      let totalBytes = 0;
+      const maxFiles = 500;
+      const maxTotalBytes = 100 * 1024 * 1024;
+
+      if (entries.length > maxFiles) {
+        throw new Error("ZIP terlalu banyak entry (maksimal 500).");
+      }
 
       for (const entryName of entries) {
         const entry = zip.files[entryName];
         if (entry.dir) continue;
 
+        const relativePath = entryName.replace(/\\/g, "/").replace(/^\/+/, "");
+        const parts = relativePath.split("/");
+        if (
+          !relativePath ||
+          relativePath.includes("\0") ||
+          /^[A-Za-z]:/.test(relativePath) ||
+          parts.some((part) => !part || part === "." || part === "..")
+        ) {
+          throw new Error(`Path ZIP tidak aman: ${entryName}`);
+        }
+
         const content = await entry.async("blob");
-        const baseName = entryName.split("/").pop() || entryName;
-        const path = `${server.id}/${baseName}`;
+        totalBytes += content.size;
+        if (content.size > 20 * 1024 * 1024 || totalBytes > maxTotalBytes) {
+          throw new Error("ZIP melewati batas 20 MB per file atau 100 MB total.");
+        }
 
-        await supabase.storage
+        const storagePath = `${server.id}/${relativePath}`;
+        const displayName = parts[parts.length - 1];
+
+        const { error: uploadError } = await supabase.storage
           .from("server-files")
-          .upload(path, content, { upsert: true });
+          .upload(storagePath, content, { upsert: true });
+        if (uploadError) {
+          throw new Error(`Upload ${relativePath} gagal: ${uploadError.message}`);
+        }
 
-        await supabase.from("server_files").upsert(
+        const { error: metadataError } = await supabase.from("server_files").upsert(
           {
             server_id: server.id,
-            path: "/" + baseName,
-            name: baseName,
+            path: "/" + relativePath,
+            name: displayName,
             is_directory: false,
             size_bytes: content.size,
-            storage_path: path,
+            storage_path: storagePath,
           },
           { onConflict: "server_id,path" }
         );
+        if (metadataError) {
+          throw new Error(`Metadata ${relativePath} gagal: ${metadataError.message}`);
+        }
+
         count++;
       }
 
-      addLog(`Extract selesai: ${count} file.`);
+      addLog(`Extract selesai: ${count} file; struktur folder dipertahankan.`);
       await load();
     } catch (err: any) {
       addLog("Extract error: " + err.message);
