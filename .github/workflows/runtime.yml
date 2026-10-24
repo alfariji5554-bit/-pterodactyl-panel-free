@@ -1,5 +1,7 @@
 name: Temporary Node Runtime
 
+run-name: runtime-${{ inputs.server_id }}
+
 on:
   workflow_dispatch:
     inputs:
