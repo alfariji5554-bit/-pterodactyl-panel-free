@@ -29,9 +29,12 @@ concurrency:
 
 jobs:
   fetch-files:
-    name: Prepare server files
+    name: Restore server files
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
+    outputs:
+      should_run: ${{ steps.state.outputs.should_run }}
 
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -43,20 +46,79 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$SUPABASE_URL" || {
-            echo "SUPABASE_URL belum diatur."
-            exit 1
-          }
-          test -n "$SUPABASE_SERVICE_ROLE_KEY" || {
-            echo "SUPABASE_SERVICE_ROLE_KEY belum diatur."
-            exit 1
-          }
-          test -n "$SERVER_ID" || {
-            echo "SERVER_ID kosong."
-            exit 1
+          test -n "$SUPABASE_URL"
+          test -n "$SUPABASE_SERVICE_ROLE_KEY"
+          test -n "$SERVER_ID"
+
+      - name: Check server state
+        id: state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node <<'NODE'
+          const base = process.env.SUPABASE_URL.replace(/\/+$/, "");
+          const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+          const sid = process.env.SERVER_ID;
+
+          async function main() {
+            const params = new URLSearchParams({
+              select: "id,status",
+              id: `eq.${sid}`,
+              limit: "1",
+            });
+
+            const response = await fetch(
+              `${base}/rest/v1/servers?${params}`,
+              {
+                headers: {
+                  apikey: key,
+                  Authorization: `Bearer ${key}`,
+                },
+              }
+            );
+
+            if (!response.ok) {
+              throw new Error(
+                `Gagal memeriksa server: HTTP ${response.status}`
+              );
+            }
+
+            const rows = await response.json();
+
+            if (!rows.length) {
+              throw new Error("Server tidak ditemukan di Supabase.");
+            }
+
+            const status = String(rows[0].status || "").toLowerCase();
+            const stopped = [
+              "stopped",
+              "stopping",
+              "suspended",
+              "deleted",
+            ].includes(status);
+
+            const fs = require("fs");
+            fs.appendFileSync(
+              process.env.GITHUB_OUTPUT,
+              `should_run=${stopped ? "false" : "true"}\n`
+            );
+
+            console.log(`Status server: ${status}`);
+
+            if (stopped) {
+              console.log("Server dihentikan. Runtime tidak akan dimulai.");
+            }
           }
 
-      - name: Restore server files from Supabase
+          main().catch(error => {
+            console.error(error.message);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Restore files from Supabase
+        if: steps.state.outputs.should_run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -119,23 +181,23 @@ jobs:
 
               for (const row of rows) {
                 const relative = String(row.path || "").replace(/^\/+/, "");
-                const segments = relative.split("/");
+                const parts = relative.split("/");
 
                 if (
                   !relative ||
                   path.isAbsolute(relative) ||
-                  segments.some(part =>
+                  parts.some(part =>
                     !part || part === "." || part === ".." || part === ".git"
                   )
                 ) {
-                  console.warn(`Path tidak valid, dilewati: ${row.path}`);
+                  console.warn(`Path tidak valid: ${row.path}`);
                   continue;
                 }
 
                 const destination = path.resolve(root, relative);
 
                 if (!destination.startsWith(root + path.sep)) {
-                  console.warn(`Path di luar runtime, dilewati: ${row.path}`);
+                  console.warn(`Path di luar runtime: ${row.path}`);
                   continue;
                 }
 
@@ -143,18 +205,17 @@ jobs:
                   row.storage_path || `${sid}/${relative}`
                 ).replace(/^\/+/, "");
 
-                // Pastikan file hanya diambil dari prefix server ini.
                 if (!storagePath.startsWith(`${sid}/`)) {
                   storagePath = `${sid}/${relative}`;
                 }
 
-                const encodedPath = storagePath
+                const encoded = storagePath
                   .split("/")
                   .map(encodeURIComponent)
                   .join("/");
 
                 const fileResponse = await request(
-                  `${base}/storage/v1/object/server-files/${encodedPath}`
+                  `${base}/storage/v1/object/server-files/${encoded}`
                 );
 
                 fs.mkdirSync(path.dirname(destination), {
@@ -183,7 +244,8 @@ jobs:
           });
           NODE
 
-      - name: Upload runtime artifact
+      - name: Upload runtime files
+        if: steps.state.outputs.should_run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: runtime-files-${{ inputs.server_id }}
@@ -193,8 +255,9 @@ jobs:
           retention-days: 1
 
   execute:
-    name: Run server
+    name: Run server with auto-restart
     needs: fetch-files
+    if: needs.fetch-files.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
@@ -209,7 +272,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download runtime artifact
+      - name: Download restored files
         uses: actions/download-artifact@v4
         with:
           name: runtime-files-${{ inputs.server_id }}
@@ -241,20 +304,17 @@ jobs:
           echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
           echo "Direktori aplikasi ditemukan."
 
-      - name: Install synchronization helper
-        shell: bash
+      - name: Install sync helper
         env:
           APP_DIR: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          test -f "$GITHUB_WORKSPACE/sync-runtime-files.js" || {
-            echo "sync-runtime-files.js tidak ditemukan di root repository."
-            exit 1
-          }
+          test -f "$GITHUB_WORKSPACE/sync-runtime-files.js"
 
           cp "$GITHUB_WORKSPACE/sync-runtime-files.js" \
-             "$APP_DIR/sync-runtime-files.js"
+            "$APP_DIR/sync-runtime-files.js"
 
       - name: Install application dependencies
         working-directory: ${{ steps.locate.outputs.app_dir }}
@@ -262,21 +322,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -f package.json ]]; then
-            if [[ -f package-lock.json ]]; then
-              npm ci
-            else
-              npm install
-            fi
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          elif [[ -f package.json ]]; then
+            npm install
           else
-            echo "package.json tidak ditemukan; instalasi dilewati."
+            echo "package.json tidak ditemukan."
           fi
 
-      - name: Locate environment file
+      - name: Locate .env
         id: envfile
-        shell: bash
         env:
           APP_DIR: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -284,13 +342,13 @@ jobs:
 
           if [[ -f "$APP_DIR/.env" ]]; then
             echo "env_file=$APP_DIR/.env" >> "$GITHUB_OUTPUT"
-            echo "File environment aplikasi ditemukan."
+            echo ".env aplikasi ditemukan."
           elif [[ -f "$ROOT/.env" ]]; then
             echo "env_file=$ROOT/.env" >> "$GITHUB_OUTPUT"
-            echo "File environment root ditemukan."
+            echo ".env root ditemukan."
           else
             echo "env_file=" >> "$GITHUB_OUTPUT"
-            echo "File .env tidak ditemukan; proses akan memakai environment yang tersedia."
+            echo ".env tidak ditemukan."
           fi
 
       - name: Create runtime log collector
@@ -313,30 +371,22 @@ jobs:
             .map(([, value]) => value);
 
           function redact(message) {
-            let result = message;
-
             for (const secret of secrets) {
-              result = result.split(secret).join("[REDACTED]");
+              message = message.split(secret).join("[REDACTED]");
             }
-
-            return result;
+            return message;
           }
 
           function level(message) {
-            if (/\b(error|fatal|exception|failed)\b/i.test(message)) {
-              return "error";
-            }
-            if (/\b(warn|warning)\b/i.test(message)) {
-              return "warning";
-            }
-            if (/\b(debug|trace)\b/i.test(message)) {
-              return "debug";
-            }
+            if (/\b(error|fatal|exception|failed)\b/i.test(message)) return "error";
+            if (/\b(warn|warning)\b/i.test(message)) return "warning";
+            if (/\b(debug|trace)\b/i.test(message)) return "debug";
             return "info";
           }
 
           let queue = [];
           let busy = false;
+          let closing = false;
 
           async function flush() {
             if (busy || queue.length === 0) return;
@@ -345,41 +395,31 @@ jobs:
             const batch = queue.splice(0, 20);
 
             try {
-              const response = await fetch(
-                `${base}/rest/v1/runtime_logs`,
-                {
-                  method: "POST",
-                  headers: {
-                    apikey: key,
-                    Authorization: `Bearer ${key}`,
-                    "Content-Type": "application/json",
-                    Prefer: "return=minimal",
-                  },
-                  body: JSON.stringify(
-                    batch.map(message => ({
-                      server_id: sid,
-                      log_level: level(message),
-                      message: message.slice(0, 8000),
-                    }))
-                  ),
-                  signal: AbortSignal.timeout(15000),
-                }
-              );
+              const response = await fetch(`${base}/rest/v1/runtime_logs`, {
+                method: "POST",
+                headers: {
+                  apikey: key,
+                  Authorization: `Bearer ${key}`,
+                  "Content-Type": "application/json",
+                  Prefer: "return=minimal",
+                },
+                body: JSON.stringify(batch.map(message => ({
+                  server_id: sid,
+                  log_level: level(message),
+                  message: message.slice(0, 8000),
+                }))),
+                signal: AbortSignal.timeout(15000),
+              });
 
               if (!response.ok) {
-                const detail = (await response.text()).slice(0, 200);
-                console.error(`Penyimpanan log gagal: HTTP ${response.status} ${detail}`);
-                queue.unshift(...batch);
+                console.error(`Penyimpanan log gagal: HTTP ${response.status}`);
+                if (!closing) queue.unshift(...batch);
               }
             } catch (error) {
               console.error(`Koneksi log gagal: ${error.message}`);
-              queue.unshift(...batch);
+              if (!closing) queue.unshift(...batch);
             } finally {
-              // Batasi antrean agar tidak menghabiskan memori jika Supabase gagal.
-              if (queue.length > 500) {
-                queue = queue.slice(-500);
-              }
-
+              if (queue.length > 500) queue = queue.slice(-500);
               busy = false;
             }
           }
@@ -391,41 +431,37 @@ jobs:
 
           input.on("line", line => {
             const message = redact(line);
-
-            // Tampilkan log di GitHub Actions.
             console.log(message);
-
             queue.push(message);
-
-            if (queue.length >= 20) {
-              void flush();
-            }
+            if (queue.length >= 20) void flush();
           });
 
-          const timer = setInterval(() => {
-            void flush();
-          }, 2000);
+          const timer = setInterval(() => void flush(), 2000);
 
           input.on("close", async () => {
+            closing = true;
             clearInterval(timer);
 
-            while (busy || queue.length) {
-              if (!busy) await flush();
-              await new Promise(resolve => setTimeout(resolve, 100));
+            let attempts = 0;
+
+            while (!busy && queue.length && attempts < 3) {
+              attempts++;
+              await flush();
+              if (queue.length) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+              }
             }
           });
           NODE
 
-      - name: Initial file synchronization
+      - name: Initial file sync
         working-directory: ${{ steps.locate.outputs.app_dir }}
         env:
           RUNTIME_ROOT: ${{ github.workspace }}/runtime-files
         shell: bash
-        run: |
-          set -euo pipefail
-          node sync-runtime-files.js
+        run: node sync-runtime-files.js
 
-      - name: Start periodic file synchronization
+      - name: Start periodic file sync
         id: sync
         working-directory: ${{ steps.locate.outputs.app_dir }}
         env:
@@ -434,68 +470,176 @@ jobs:
         run: |
           set -euo pipefail
 
-          SYNC_SCRIPT="$PWD/sync-runtime-files.js"
-          SYNC_LOG="$RUNNER_TEMP/runtime-sync-${SERVER_ID}.log"
-
           (
             while true; do
-              node "$SYNC_SCRIPT" >> "$SYNC_LOG" 2>&1 || true
+              node sync-runtime-files.js || true
               sleep 60
             done
           ) >/dev/null 2>&1 &
 
           echo "pid=$!" >> "$GITHUB_OUTPUT"
-          echo "Sinkronisasi berkala dimulai."
 
-      - name: Start server process
-        id: server
+      - name: Run bot and restart after exit
         working-directory: ${{ steps.locate.outputs.app_dir }}
         env:
-          LOGGER_PATH: ${{ steps.locate.outputs.app_dir }}/runtime-log.js
           ENV_FILE: ${{ steps.envfile.outputs.env_file }}
+          LOGGER_PATH: ${{ steps.locate.outputs.app_dir }}/runtime-log.js
           RUNTIME_ROOT: ${{ github.workspace }}/runtime-files
         shell: bash
         run: |
-          set +e
+          set -uo pipefail
 
           if [[ -z "${STARTUP_COMMAND:-}" ]]; then
             echo "startup_command kosong."
             exit 1
           fi
 
-          echo "Memulai server: $SERVER_NAME"
-          echo "Direktori aplikasi: $PWD"
+          while true; do
+            echo "Memulai bot: $SERVER_NAME"
 
-          if [[ -n "${ENV_FILE:-}" && -f "$ENV_FILE" ]]; then
-            npx --yes dotenv-cli -e "$ENV_FILE" -- bash -c '
+            if [[ -n "${ENV_FILE:-}" && -f "$ENV_FILE" ]]; then
+              npx --yes dotenv-cli -e "$ENV_FILE" -- \
+                bash -c '
+                  bash -lc "$STARTUP_COMMAND" 2>&1 | node "$LOGGER_PATH"
+                  exit "${PIPESTATUS[0]}"
+                '
+              STATUS=$?
+            else
               bash -lc "$STARTUP_COMMAND" 2>&1 | node "$LOGGER_PATH"
-              status=${PIPESTATUS[0]}
-              exit "$status"
-            '
-            STATUS=$?
-          else
-            bash -lc "$STARTUP_COMMAND" 2>&1 | node "$LOGGER_PATH"
-            STATUS=${PIPESTATUS[0]}
-          fi
+              STATUS=${PIPESTATUS[0]}
+            fi
 
-          echo "Proses server selesai dengan kode: $STATUS"
-          exit "$STATUS"
+            echo "Bot berhenti dengan kode $STATUS."
+            echo "Restart dalam 10 detik."
+            sleep 10
+          done
 
-      - name: Stop periodic synchronization
+      - name: Stop periodic file sync
         if: always() && steps.sync.outputs.pid != ''
         shell: bash
         run: |
           PID="${{ steps.sync.outputs.pid }}"
-
-          # Hentikan loop sinkronisasi sebelum sinkronisasi terakhir.
           pkill -TERM -P "$PID" 2>/dev/null || true
           kill "$PID" 2>/dev/null || true
 
-      - name: Final file synchronization
+      - name: Final file sync
         if: always() && steps.locate.outputs.app_dir != ''
         working-directory: ${{ steps.locate.outputs.app_dir }}
         env:
           RUNTIME_ROOT: ${{ github.workspace }}/runtime-files
         shell: bash
         run: |
-          node sync-runtime-files.js
+          node sync-runtime-files.js || true
+
+  schedule-continuation:
+    name: Schedule next runtime cycle
+    needs: fetch-files
+    if: needs.fetch-files.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SERVER_ID: ${{ inputs.server_id }}
+      SERVER_NAME: ${{ inputs.server_name }}
+      STARTUP_COMMAND: ${{ inputs.startup_command }}
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      WORKFLOW_REF: ${{ github.ref_name }}
+
+    steps:
+      - name: Wait before next runtime cycle
+        shell: bash
+        run: |
+          echo "Runtime berikutnya dijadwalkan sekitar 320 menit."
+          sleep 19200
+
+      - name: Dispatch next runtime if server is still enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node <<'NODE'
+          const base = process.env.SUPABASE_URL.replace(/\/+$/, "");
+          const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+          const sid = process.env.SERVER_ID;
+
+          async function main() {
+            const params = new URLSearchParams({
+              select: "id,status",
+              id: `eq.${sid}`,
+              limit: "1",
+            });
+
+            const check = await fetch(
+              `${base}/rest/v1/servers?${params}`,
+              {
+                headers: {
+                  apikey: serviceKey,
+                  Authorization: `Bearer ${serviceKey}`,
+                },
+              }
+            );
+
+            if (!check.ok) {
+              throw new Error("Gagal memeriksa status server di Supabase.");
+            }
+
+            const rows = await check.json();
+
+            if (!rows.length) {
+              console.log("Server tidak ditemukan; tidak menjadwalkan ulang.");
+              return;
+            }
+
+            const status = String(rows[0].status || "").toLowerCase();
+
+            if ([
+              "stopped",
+              "stopping",
+              "suspended",
+              "deleted",
+            ].includes(status)) {
+              console.log(`Server berstatus ${status}; siklus berikutnya dibatalkan.`);
+              return;
+            }
+
+            const [owner, repo] = process.env.REPOSITORY.split("/");
+            const workflow = "runtime.yml";
+
+            const response = await fetch(
+              `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}/dispatches`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${process.env.GH_TOKEN}`,
+                  Accept: "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  ref: process.env.WORKFLOW_REF,
+                  inputs: {
+                    server_id: process.env.SERVER_ID,
+                    server_name: process.env.SERVER_NAME,
+                    startup_command: process.env.STARTUP_COMMAND,
+                  },
+                }),
+              }
+            );
+
+            if (!response.ok) {
+              throw new Error(
+                `Gagal menjadwalkan runtime berikutnya: HTTP ${response.status} ${(await response.text()).slice(0, 300)}`
+              );
+            }
+
+            console.log("Siklus runtime berikutnya berhasil dijadwalkan.");
+          }
+
+          main().catch(error => {
+            console.error(error.message);
+            process.exit(1);
+          });
+          NODE
