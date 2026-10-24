@@ -1,4 +1,3 @@
-```ts
 import {
   getRuntimeContext,
   getGitHubConfig,
@@ -170,4 +169,3 @@ export async function GET(request: Request) {
     );
   }
 }
-```
