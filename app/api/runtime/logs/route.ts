@@ -12,7 +12,8 @@ export async function GET(request: Request) {
 
   const url = new URL(request.url);
   const serverId = url.searchParams.get("serverId")?.trim();
-  const after = Number(url.searchParams.get("after") || "0");
+  const afterRaw = url.searchParams.get("after") || "0";
+  const after = Number(afterRaw);
 
   if (!serverId || !/^[0-9a-f-]{16,64}$/i.test(serverId)) {
     return Response.json(
@@ -28,7 +29,14 @@ export async function GET(request: Request) {
     .eq("owner_id", context.user!.id)
     .maybeSingle();
 
-  if (serverError || !server) {
+  if (serverError) {
+    return Response.json(
+      { error: "Gagal memeriksa server.", detail: serverError.message },
+      { status: 500 }
+    );
+  }
+
+  if (!server) {
     return Response.json(
       { error: "Server tidak ditemukan." },
       { status: 404 }
@@ -50,13 +58,18 @@ export async function GET(request: Request) {
 
   if (error) {
     return Response.json(
-      { error: "Gagal membaca log runtime.", detail: error.message },
+      {
+        error: "Gagal membaca log runtime.",
+        detail: error.message,
+      },
       { status: 500 }
     );
   }
 
+  const logs = data || [];
+
   return Response.json({
-    logs: data || [],
-    lastId: data?.length ? data[data.length - 1].id : after,
+    logs,
+    lastId: logs.length ? logs[logs.length - 1].id : after,
   });
 }
