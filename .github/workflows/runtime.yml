@@ -31,28 +31,37 @@ jobs:
   fetch-files:
     name: Prepare server files
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       SERVER_ID: ${{ inputs.server_id }}
 
     steps:
-      - uses: actions/checkout@v4
-
       - name: Validate configuration
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$SUPABASE_URL" || { echo "SUPABASE_URL belum diatur."; exit 1; }
-          test -n "$SUPABASE_SERVICE_ROLE_KEY" || { echo "SUPABASE_SERVICE_ROLE_KEY belum diatur."; exit 1; }
-          test -n "$SERVER_ID" || { echo "SERVER_ID kosong."; exit 1; }
+          test -n "$SUPABASE_URL" || {
+            echo "SUPABASE_URL belum diatur."
+            exit 1
+          }
+          test -n "$SUPABASE_SERVICE_ROLE_KEY" || {
+            echo "SUPABASE_SERVICE_ROLE_KEY belum diatur."
+            exit 1
+          }
+          test -n "$SERVER_ID" || {
+            echo "SERVER_ID kosong."
+            exit 1
+          }
 
-      - name: Download server files
+      - name: Restore server files from Supabase
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p runtime-files
+          touch runtime-files/.runtime-placeholder
 
           node <<'NODE'
           const fs = require("fs");
@@ -63,92 +72,124 @@ jobs:
           const sid = process.env.SERVER_ID;
           const root = path.resolve("runtime-files");
 
-          async function request(url) {
-            const r = await fetch(url, {
+          async function request(url, options = {}) {
+            const response = await fetch(url, {
+              ...options,
               headers: {
                 apikey: key,
                 Authorization: `Bearer ${key}`,
+                ...options.headers,
               },
+              signal: AbortSignal.timeout(60000),
             });
 
-            if (!r.ok) {
-              throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 300)}`);
+            if (!response.ok) {
+              throw new Error(
+                `HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`
+              );
             }
 
-            return r;
+            return response;
           }
 
           async function main() {
-            const params = new URLSearchParams({
-              select: "path,name,is_directory,storage_path",
-              server_id: `eq.${sid}`,
-              is_directory: "eq.false",
-              order: "path.asc",
-            });
+            let offset = 0;
+            let restored = 0;
 
-            const r = await request(`${base}/rest/v1/server_files?${params}`);
-            const rows = await r.json();
-            let count = 0;
+            while (true) {
+              const params = new URLSearchParams({
+                select: "path,name,is_directory,storage_path",
+                server_id: `eq.${sid}`,
+                is_directory: "eq.false",
+                order: "path.asc",
+                limit: "1000",
+              });
 
-            for (const row of rows) {
-              const relative = String(row.path || "").replace(/^\/+/, "");
-
-              if (
-                !relative ||
-                relative.split("/").some(p =>
-                  !p || p === "." || p === ".." || p === ".git"
-                ) ||
-                path.isAbsolute(relative)
-              ) {
-                console.warn(`Path dilewati: ${row.path}`);
-                continue;
-              }
-
-              const dest = path.resolve(root, relative);
-
-              if (!dest.startsWith(root + path.sep)) {
-                console.warn(`Path di luar direktori dilewati: ${row.path}`);
-                continue;
-              }
-
-              const objectPath = String(
-                row.storage_path || `${sid}/${relative}`
-              ).replace(/^\/+/, "");
-
-              const encoded = objectPath
-                .split("/")
-                .map(encodeURIComponent)
-                .join("/");
-
-              const fileResponse = await request(
-                `${base}/storage/v1/object/server-files/${encoded}`
+              const response = await request(
+                `${base}/rest/v1/server_files?${params}`,
+                {
+                  headers: {
+                    Range: `${offset}-${offset + 999}`,
+                    "Range-Unit": "items",
+                  },
+                }
               );
 
-              fs.mkdirSync(path.dirname(dest), { recursive: true });
-              fs.writeFileSync(
-                dest,
-                Buffer.from(await fileResponse.arrayBuffer())
-              );
+              const rows = await response.json();
 
-              count++;
-              console.log(`Diunduh: ${relative}`);
+              for (const row of rows) {
+                const relative = String(row.path || "").replace(/^\/+/, "");
+                const segments = relative.split("/");
+
+                if (
+                  !relative ||
+                  path.isAbsolute(relative) ||
+                  segments.some(part =>
+                    !part || part === "." || part === ".." || part === ".git"
+                  )
+                ) {
+                  console.warn(`Path tidak valid, dilewati: ${row.path}`);
+                  continue;
+                }
+
+                const destination = path.resolve(root, relative);
+
+                if (!destination.startsWith(root + path.sep)) {
+                  console.warn(`Path di luar runtime, dilewati: ${row.path}`);
+                  continue;
+                }
+
+                let storagePath = String(
+                  row.storage_path || `${sid}/${relative}`
+                ).replace(/^\/+/, "");
+
+                // Pastikan file hanya diambil dari prefix server ini.
+                if (!storagePath.startsWith(`${sid}/`)) {
+                  storagePath = `${sid}/${relative}`;
+                }
+
+                const encodedPath = storagePath
+                  .split("/")
+                  .map(encodeURIComponent)
+                  .join("/");
+
+                const fileResponse = await request(
+                  `${base}/storage/v1/object/server-files/${encodedPath}`
+                );
+
+                fs.mkdirSync(path.dirname(destination), {
+                  recursive: true,
+                });
+
+                fs.writeFileSync(
+                  destination,
+                  Buffer.from(await fileResponse.arrayBuffer())
+                );
+
+                restored++;
+                console.log(`Dipulihkan: ${relative}`);
+              }
+
+              if (rows.length < 1000) break;
+              offset += rows.length;
             }
 
-            console.log(`Total file dipulihkan: ${count}`);
+            console.log(`Total file dipulihkan: ${restored}`);
           }
 
-          main().catch(e => {
-            console.error(e.message);
+          main().catch(error => {
+            console.error(error.message);
             process.exit(1);
           });
           NODE
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
         with:
           name: runtime-files-${{ inputs.server_id }}
           path: runtime-files/
           include-hidden-files: true
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 1
 
   execute:
@@ -163,15 +204,19 @@ jobs:
       SERVER_ID: ${{ inputs.server_id }}
       SERVER_NAME: ${{ inputs.server_name }}
       STARTUP_COMMAND: ${{ inputs.startup_command }}
-      BOT_TOKEN_SECRET: ${{ secrets.BOT_TOKEN }}
 
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download runtime artifact
+        uses: actions/download-artifact@v4
         with:
           name: runtime-files-${{ inputs.server_id }}
           path: runtime-files
 
-      - uses: actions/setup-node@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: "22"
 
@@ -182,6 +227,7 @@ jobs:
           set -euo pipefail
 
           ROOT="$GITHUB_WORKSPACE/runtime-files"
+
           PACKAGE_FILE="$(find "$ROOT" \
             -type d \( -name node_modules -o -name .git \) -prune -o \
             -type f -name package.json -print -quit)"
@@ -193,37 +239,59 @@ jobs:
           fi
 
           echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
-          echo "Direktori aplikasi: $APP_DIR"
+          echo "Direktori aplikasi ditemukan."
 
-      - name: Install dependencies
+      - name: Install synchronization helper
+        shell: bash
+        env:
+          APP_DIR: ${{ steps.locate.outputs.app_dir }}
+        run: |
+          set -euo pipefail
+
+          test -f "$GITHUB_WORKSPACE/sync-runtime-files.js" || {
+            echo "sync-runtime-files.js tidak ditemukan di root repository."
+            exit 1
+          }
+
+          cp "$GITHUB_WORKSPACE/sync-runtime-files.js" \
+             "$APP_DIR/sync-runtime-files.js"
+
+      - name: Install application dependencies
         working-directory: ${{ steps.locate.outputs.app_dir }}
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ -f package-lock.json ]]; then
-            npm ci
-          elif [[ -f package.json ]]; then
-            npm install
+          if [[ -f package.json ]]; then
+            if [[ -f package-lock.json ]]; then
+              npm ci
+            else
+              npm install
+            fi
           else
             echo "package.json tidak ditemukan; instalasi dilewati."
           fi
 
-      - name: Prepare bot environment
+      - name: Locate environment file
+        id: envfile
         shell: bash
+        env:
+          APP_DIR: ${{ steps.locate.outputs.app_dir }}
         run: |
           set -euo pipefail
 
-          if [[ -z "${BOT_TOKEN_SECRET:-}" ]]; then
-            echo "Secret BOT_TOKEN belum diatur."
-            exit 1
-          fi
+          ROOT="$GITHUB_WORKSPACE/runtime-files"
 
-          {
-            echo "BOT_TOKEN<<BOT_TOKEN_EOF"
-            printf '%s\n' "$BOT_TOKEN_SECRET"
-            echo "BOT_TOKEN_EOF"
-          } >> "$GITHUB_ENV"
+          if [[ -f "$APP_DIR/.env" ]]; then
+            echo "env_file=$APP_DIR/.env" >> "$GITHUB_OUTPUT"
+            echo "File environment aplikasi ditemukan."
+          elif [[ -f "$ROOT/.env" ]]; then
+            echo "env_file=$ROOT/.env" >> "$GITHUB_OUTPUT"
+            echo "File environment root ditemukan."
+          else
+            echo "env_file=" >> "$GITHUB_OUTPUT"
+            echo "File .env tidak ditemukan; proses akan memakai environment yang tersedia."
+          fi
 
       - name: Create runtime log collector
         working-directory: ${{ steps.locate.outputs.app_dir }}
@@ -235,21 +303,40 @@ jobs:
           const base = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
           const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
           const sid = process.env.SERVER_ID;
-          const secret = process.env.BOT_TOKEN_SECRET || "";
+
+          const secrets = Object.entries(process.env)
+            .filter(([name, value]) =>
+              /TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY/i.test(name) &&
+              typeof value === "string" &&
+              value.length >= 6
+            )
+            .map(([, value]) => value);
+
+          function redact(message) {
+            let result = message;
+
+            for (const secret of secrets) {
+              result = result.split(secret).join("[REDACTED]");
+            }
+
+            return result;
+          }
+
+          function level(message) {
+            if (/\b(error|fatal|exception|failed)\b/i.test(message)) {
+              return "error";
+            }
+            if (/\b(warn|warning)\b/i.test(message)) {
+              return "warning";
+            }
+            if (/\b(debug|trace)\b/i.test(message)) {
+              return "debug";
+            }
+            return "info";
+          }
 
           let queue = [];
           let busy = false;
-
-          function redact(s) {
-            return secret ? s.split(secret).join("[REDACTED]") : s;
-          }
-
-          function level(s) {
-            if (/\b(error|fatal|exception|failed)\b/i.test(s)) return "error";
-            if (/\b(warn|warning)\b/i.test(s)) return "warning";
-            if (/\b(debug|trace)\b/i.test(s)) return "debug";
-            return "info";
-          }
 
           async function flush() {
             if (busy || queue.length === 0) return;
@@ -258,35 +345,42 @@ jobs:
             const batch = queue.splice(0, 20);
 
             try {
-              const r = await fetch(`${base}/rest/v1/runtime_logs`, {
-                method: "POST",
-                headers: {
-                  apikey: key,
-                  Authorization: `Bearer ${key}`,
-                  "Content-Type": "application/json",
-                  Prefer: "return=minimal",
-                },
-                body: JSON.stringify(batch.map(message => ({
-                  server_id: sid,
-                  log_level: level(message),
-                  message: message.slice(0, 8000),
-                }))),
-              });
+              const response = await fetch(
+                `${base}/rest/v1/runtime_logs`,
+                {
+                  method: "POST",
+                  headers: {
+                    apikey: key,
+                    Authorization: `Bearer ${key}`,
+                    "Content-Type": "application/json",
+                    Prefer: "return=minimal",
+                  },
+                  body: JSON.stringify(
+                    batch.map(message => ({
+                      server_id: sid,
+                      log_level: level(message),
+                      message: message.slice(0, 8000),
+                    }))
+                  ),
+                  signal: AbortSignal.timeout(15000),
+                }
+              );
 
-              if (!r.ok) {
-                console.error(
-                  `Log Supabase gagal: ${r.status} ${(await r.text()).slice(0, 300)}`
-                );
+              if (!response.ok) {
+                const detail = (await response.text()).slice(0, 200);
+                console.error(`Penyimpanan log gagal: HTTP ${response.status} ${detail}`);
                 queue.unshift(...batch);
               }
-            } catch (e) {
-              console.error(`Log error: ${e.message}`);
+            } catch (error) {
+              console.error(`Koneksi log gagal: ${error.message}`);
               queue.unshift(...batch);
             } finally {
-              busy = false;
-              if (queue.length) {
-                setTimeout(() => void flush(), 1000);
+              // Batasi antrean agar tidak menghabiskan memori jika Supabase gagal.
+              if (queue.length > 500) {
+                queue = queue.slice(-500);
               }
+
+              busy = false;
             }
           }
 
@@ -297,12 +391,24 @@ jobs:
 
           input.on("line", line => {
             const message = redact(line);
+
+            // Tampilkan log di GitHub Actions.
             console.log(message);
+
             queue.push(message);
-            if (queue.length >= 20) void flush();
+
+            if (queue.length >= 20) {
+              void flush();
+            }
           });
 
+          const timer = setInterval(() => {
+            void flush();
+          }, 2000);
+
           input.on("close", async () => {
+            clearInterval(timer);
+
             while (busy || queue.length) {
               if (!busy) await flush();
               await new Promise(resolve => setTimeout(resolve, 100));
@@ -310,220 +416,14 @@ jobs:
           });
           NODE
 
-      - name: Create persistent file synchronization helper
+      - name: Initial file synchronization
         working-directory: ${{ steps.locate.outputs.app_dir }}
+        env:
+          RUNTIME_ROOT: ${{ github.workspace }}/runtime-files
         shell: bash
         run: |
-          cat > sync-runtime-files.js <<'NODE'
-          const fs = require("fs");
-          const path = require("path");
-          const crypto = require("crypto");
-
-          const base = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
-          const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-          const sid = process.env.SERVER_ID;
-          const root = path.resolve(process.env.RUNTIME_ROOT || process.cwd());
-
-          const ignored = new Set([
-            ".git",
-            "node_modules",
-            ".next",
-            ".turbo",
-            ".cache",
-          ]);
-
-          const helperFiles = new Set([
-            "runtime-log.js",
-            "sync-runtime-files.js",
-          ]);
-
-          const uploadedHashes = new Map();
-          let syncing = false;
-
-          async function request(url, options = {}) {
-            let lastError;
-
-            for (let attempt = 1; attempt <= 3; attempt++) {
-              try {
-                const r = await fetch(url, {
-                  ...options,
-                  headers: {
-                    apikey: key,
-                    Authorization: `Bearer ${key}`,
-                    ...options.headers,
-                  },
-                  signal: AbortSignal.timeout(60000),
-                });
-
-                if (r.ok) return r;
-
-                const message =
-                  `HTTP ${r.status}: ${(await r.text()).slice(0, 300)}`;
-
-                if (r.status < 500 && r.status !== 429) {
-                  throw new Error(message);
-                }
-
-                lastError = new Error(message);
-              } catch (e) {
-                lastError = e;
-              }
-
-              if (attempt < 3) {
-                await new Promise(resolve => setTimeout(resolve, attempt * 1500));
-              }
-            }
-
-            throw lastError || new Error("Request gagal.");
-          }
-
-          function walk(dir, out = []) {
-            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-              const full = path.join(dir, entry.name);
-              const rel = path.relative(root, full).split(path.sep).join("/");
-              const parts = rel.split("/");
-
-              if (
-                parts.some(p => ignored.has(p) || p.startsWith(".env")) ||
-                helperFiles.has(path.basename(rel)) ||
-                entry.isSymbolicLink()
-              ) {
-                continue;
-              }
-
-              if (entry.isDirectory()) {
-                walk(full, out);
-              } else if (entry.isFile()) {
-                out.push({ full, rel });
-              }
-            }
-
-            return out;
-          }
-
-          async function sync() {
-            if (syncing) {
-              console.log("Sinkronisasi sebelumnya masih berjalan; dilewati.");
-              return;
-            }
-
-            syncing = true;
-
-            try {
-              if (!base || !key || !sid) {
-                throw new Error("Konfigurasi Supabase tidak lengkap.");
-              }
-
-              const files = walk(root);
-              let uploaded = 0;
-              let skipped = 0;
-              let totalBytes = 0;
-              const maxFileSize = 20 * 1024 * 1024;
-              const maxBatchBytes = 100 * 1024 * 1024;
-
-              for (const file of files) {
-                let content;
-
-                try {
-                  content = fs.readFileSync(file.full);
-                } catch (e) {
-                  console.warn(`File gagal dibaca: ${file.rel}: ${e.message}`);
-                  continue;
-                }
-
-                if (content.length > maxFileSize) {
-                  console.warn(`File lebih dari 20 MB dilewati: ${file.rel}`);
-                  continue;
-                }
-
-                const hash = crypto
-                  .createHash("sha256")
-                  .update(content)
-                  .digest("hex");
-
-                if (uploadedHashes.get(file.rel) === hash) {
-                  skipped++;
-                  continue;
-                }
-
-                if (totalBytes + content.length > maxBatchBytes) {
-                  console.warn(
-                    "Batas 100 MB per putaran tercapai; file sisanya dicoba pada putaran berikutnya."
-                  );
-                  break;
-                }
-
-                const storagePath = `${sid}/${file.rel}`;
-                const encoded = storagePath
-                  .split("/")
-                  .map(encodeURIComponent)
-                  .join("/");
-
-                await request(
-                  `${base}/storage/v1/object/server-files/${encoded}`,
-                  {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/octet-stream",
-                      "x-upsert": "true",
-                    },
-                    body: content,
-                  }
-                );
-
-                const row = {
-                  server_id: sid,
-                  path: file.rel.replace(/^\/+/, ""),
-                  name: path.basename(file.rel),
-                  is_directory: false,
-                  size_bytes: content.length,
-                  mime_type: "application/octet-stream",
-                  storage_path: storagePath,
-                  updated_at: new Date().toISOString(),
-                };
-
-                const params = new URLSearchParams({
-                  on_conflict: "server_id,path",
-                });
-
-                await request(
-                  `${base}/rest/v1/server_files?${params}`,
-                  {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                      Prefer: "resolution=merge-duplicates,return=minimal",
-                    },
-                    body: JSON.stringify(row),
-                  }
-                );
-
-                uploadedHashes.set(file.rel, hash);
-                totalBytes += content.length;
-                uploaded++;
-
-                console.log(`Tersimpan: ${file.rel}`);
-              }
-
-              console.log(
-                `Sinkronisasi selesai. File baru/berubah: ${uploaded}; tidak berubah: ${skipped}.`
-              );
-            } catch (e) {
-              console.error(`Sinkronisasi gagal: ${e.message}`);
-            } finally {
-              syncing = false;
-            }
-          }
-
-          if (require.main === module) {
-            sync().catch(e => {
-              console.error(e.message);
-              process.exitCode = 1;
-            });
-          }
-
-          module.exports = { sync };
-          NODE
+          set -euo pipefail
+          node sync-runtime-files.js
 
       - name: Start periodic file synchronization
         id: sync
@@ -534,28 +434,29 @@ jobs:
         run: |
           set -euo pipefail
 
+          SYNC_SCRIPT="$PWD/sync-runtime-files.js"
+          SYNC_LOG="$RUNNER_TEMP/runtime-sync-${SERVER_ID}.log"
+
           (
             while true; do
-              node sync-runtime-files.js
-              sleep 15
+              node "$SYNC_SCRIPT" >> "$SYNC_LOG" 2>&1 || true
+              sleep 60
             done
-          ) &
-          echo "pid=$!" >> "$GITHUB_OUTPUT"
+          ) >/dev/null 2>&1 &
 
-      - name: Initial file synchronization
-        working-directory: ${{ steps.locate.outputs.app_dir }}
-        env:
-          RUNTIME_ROOT: ${{ github.workspace }}/runtime-files
-        shell: bash
-        run: node sync-runtime-files.js
+          echo "pid=$!" >> "$GITHUB_OUTPUT"
+          echo "Sinkronisasi berkala dimulai."
 
       - name: Start server process
+        id: server
         working-directory: ${{ steps.locate.outputs.app_dir }}
         env:
+          LOGGER_PATH: ${{ steps.locate.outputs.app_dir }}/runtime-log.js
+          ENV_FILE: ${{ steps.envfile.outputs.env_file }}
           RUNTIME_ROOT: ${{ github.workspace }}/runtime-files
         shell: bash
         run: |
-          set -uo pipefail
+          set +e
 
           if [[ -z "${STARTUP_COMMAND:-}" ]]; then
             echo "startup_command kosong."
@@ -563,12 +464,19 @@ jobs:
           fi
 
           echo "Memulai server: $SERVER_NAME"
-          echo "Folder aplikasi: $PWD"
+          echo "Direktori aplikasi: $PWD"
 
-          set +e
-          bash -lc "$STARTUP_COMMAND" 2>&1 | node runtime-log.js
-          STATUS=${PIPESTATUS[0]}
-          set -e
+          if [[ -n "${ENV_FILE:-}" && -f "$ENV_FILE" ]]; then
+            npx --yes dotenv-cli -e "$ENV_FILE" -- bash -c '
+              bash -lc "$STARTUP_COMMAND" 2>&1 | node "$LOGGER_PATH"
+              status=${PIPESTATUS[0]}
+              exit "$status"
+            '
+            STATUS=$?
+          else
+            bash -lc "$STARTUP_COMMAND" 2>&1 | node "$LOGGER_PATH"
+            STATUS=${PIPESTATUS[0]}
+          fi
 
           echo "Proses server selesai dengan kode: $STATUS"
           exit "$STATUS"
@@ -578,8 +486,10 @@ jobs:
         shell: bash
         run: |
           PID="${{ steps.sync.outputs.pid }}"
+
+          # Hentikan loop sinkronisasi sebelum sinkronisasi terakhir.
+          pkill -TERM -P "$PID" 2>/dev/null || true
           kill "$PID" 2>/dev/null || true
-          pkill -P "$PID" 2>/dev/null || true
 
       - name: Final file synchronization
         if: always() && steps.locate.outputs.app_dir != ''
