@@ -1,0 +1,28 @@
+name: Validate Battle X Ground API
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "battle_x_ground_server/**"
+      - ".github/workflows/validate-api.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: "battle_x_ground_server/package-lock.json"
+      - name: Install dependencies
+        working-directory: battle_x_ground_server
+        run: npm install --ignore-scripts
+      - name: Check JavaScript syntax
+        working-directory: battle_x_ground_server
+        run: node --check index.js
+      - name: Explain this is validation only
+        run: echo "Validation complete. This workflow does NOT host a public API or game server."
